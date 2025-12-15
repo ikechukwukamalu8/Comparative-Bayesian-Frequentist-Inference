@@ -1,0 +1,136 @@
+﻿# ==============================================================================
+# PROJECT: Comparative Statistical Inference for Overdispersed Count Data
+# FOCUS: Statistical Rigor, Model Diagnostics, Bayesian vs. Frequentist
+# ==============================================================================
+
+# Load libraries
+library(tidyverse)  # Data manipulation
+library(lubridate)  # Handling dates
+library(ISOweek)    # Converting ISO week to Date
+library(ggplot2)    # Visualization
+library(stats4)     # MLE estimation
+library(rjags)      # JAGS for Bayesian inference
+library(coda)       # MCMC diagnostics
+library(MASS)       # Negative Binomial MLE (glm.nb)
+library(AER)        # Overdispersion test
+
+# ------------------------------------------------------------------------------
+# 1. Data Cleaning and Preparation (Using Provided EU Vaccination Data)
+# ------------------------------------------------------------------------------
+
+# **CRITICAL:** The script now uses the recommended, descriptive file name.
+file_path <- "EU_COVID19_Vaccination_Counts.csv"
+covid_data <- read.csv(file_path, stringsAsFactors = FALSE)
+
+# Handle missing values 
+covid_data <- covid_data %>%
+  mutate(
+    # Impute missing NumberOfIndivOneDose with the median (for robustness)
+    NumberOfIndivOneDose = ifelse(is.na(NumberOfIndivOneDose), 
+                                  median(NumberOfIndivOneDose, na.rm = TRUE), 
+                                  NumberOfIndivOneDose),
+    # Impute missing Denominator with the mean (simpler approach for demonstration)
+    Denominator = ifelse(is.na(Denominator), mean(Denominator, na.rm = TRUE), Denominator)
+  )
+
+# Convert YearWeekISO to Date (Monday of the week)
+covid_data <- covid_data %>%
+  mutate(
+    YearWeekISO_Corrected = paste0(substr(YearWeekISO, 1, 4), "-W", substr(YearWeekISO, 6, 7)),
+    Date = ISOweek2date(paste0(YearWeekISO_Corrected, "-1"))
+  )
+
+# Filter for a specific country for the count model (e.g., Belgium - "BE")
+country <- "BE"
+vaccine_data <- covid_data %>% 
+  filter(ReportingCountry == country) %>%
+  # Aggregate counts per week (essential as data is stratified by TargetGroup/Vaccine)
+  group_by(YearWeekISO, Date) %>%
+  summarise(
+    NumberOfIndivOneDose = sum(NumberOfIndivOneDose, na.rm = TRUE),
+    .groups = 'drop'
+  )
+
+# ------------------------------------------------------------------------------
+# 2. Maximum Likelihood Estimation (MLE) for Negative Binomial
+# ------------------------------------------------------------------------------
+
+# Fit the Negative Binomial model (the alternative hypothesis to Poisson)
+# Modeling using an intercept-only model for simplicity: NumberOfIndivOneDose ~ 1
+nb_fit_mle <- glm.nb(NumberOfIndivOneDose ~ 1, data = vaccine_data)
+
+# ------------------------------------------------------------------------------
+# 3. Model Diagnostics: Testing for Overdispersion (Demonstrates Statistical Rigor)
+# ------------------------------------------------------------------------------
+
+# Overdispersion Test (Null Hypothesis: Data is Poisson Distributed)
+dispersion_test <- AER::dispersiontest(nb_fit_mle, trafo=1)
+cat("\nOverdispersion Test (Null: Poisson, Trafo=1):\n")
+print(dispersion_test) 
+# Note: A low p-value confirms overdispersion, justifying the Negative Binomial model.
+
+# ------------------------------------------------------------------------------
+# 4. Comparative Inference: Bayesian (JAGS) vs. Frequentist (MLE)
+# ------------------------------------------------------------------------------
+
+# --- Bayesian Inference via JAGS ---
+model_string <- "
+model {
+  # Likelihood (Negative Binomial parameterized by mean 'lambda' and size 'r')
+  for (i in 1:N) {
+    y[i] ~ dnegbin(p[i], r)  
+    p[i] <- r / (r + lambda)  # Conversion for JAGS dnegbin(p, r)
+  }
+  
+  # Weak Priors 
+  lambda ~ dgamma(0.001, 0.001)  # Prior for the mean rate
+  r ~ dgamma(0.001, 0.001)       # Prior for the dispersion parameter (size)
+}
+"
+
+# Prepare data for JAGS
+y_data <- vaccine_data$NumberOfIndivOneDose
+jags_data <- list(y = y_data, N = length(y_data))
+
+# Run JAGS MCMC
+jags_model <- rjags::jags.model(textConnection(model_string), data = jags_data, n.chains = 2, n.adapt = 1000, quiet=TRUE)
+update(jags_model, 2000) 
+samples <- coda::coda.samples(jags_model, variable.names = c("lambda", "r"), n.iter = 5000)
+
+# Extract Mean Estimates
+samples_matrix <- as.matrix(samples)
+lambda_jags <- mean(samples_matrix[, "lambda"])
+r_jags <- mean(samples_matrix[, "r"])
+
+# --- Frequentist MLE (from step 2) ---
+lambda_mle <- exp(coef(nb_fit_mle)[1]) # Mean Rate
+r_mle <- nb_fit_mle$theta              # Dispersion Size
+
+# Compare JAGS vs MLE Estimates
+comparison <- data.frame(
+  Parameter = c("lambda (Mean Rate)", "r (Dispersion Size)"),
+  JAGS_Bayesian = c(lambda_jags, r_jags),
+  MLE_Frequentist = c(lambda_mle, r_mle)
+)
+cat("\nComparison of Bayesian (JAGS) vs. Frequentist (MLE) Estimates:\n")
+print(comparison)
+
+# ------------------------------------------------------------------------------
+# 5. Bayesian Model Validation: Posterior Predictive Check
+# ------------------------------------------------------------------------------
+
+# Extract posterior samples
+lambda_post <- samples_matrix[, "lambda"]
+r_post <- samples_matrix[, "r"]
+
+# Simulate data from the posterior predictive distribution
+y_sim <- rnbinom(length(lambda_post), size = r_post, mu = lambda_post)
+
+# Plot observed data distribution vs. simulated data distribution
+hist(y_sim, breaks=50, col = rgb(1, 0, 0, 0.5), probability = TRUE, 
+     main = "Posterior Predictive Check: Observed vs. Simulated Data",
+     xlab = "Number of Vaccinated Individuals")
+lines(density(vaccine_data$NumberOfIndivOneDose), col = "blue", lwd = 2)
+legend("topright", legend = c("Simulated Data (Posterior)", "Observed Data"), 
+       fill = c(rgb(1, 0, 0, 0.5), "blue"))
+#
